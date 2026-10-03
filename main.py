@@ -4,17 +4,20 @@
 ================================================================================
  warspear_esp.py — ESP 30Гц + ходьба (Warspear, uc #735117)
 ================================================================================
-КАЛИБРОВКА (одна кнопка, порядок: В СТОРОНУ → В ЦЕНТР):
-  1. Бот кликает В СТОРОНУ от центра (+320,+230) — персонаж доходит, стоп.
-  2. Бот кликает В ЦЕНТР экрана — персонаж доходит, стоп.
-  3. В этот момент мировая позиция персонажа = ЦЕНТР ЭКРАНА:
-         якорь := позиция игрока,  ME-бокс встаёт ровно в центр.
-  4. Масштаб S решается из пройденного пути: S = Δpx / Δмир.
-  Якорь устанавливается ОДИН РАЗ при калибровке и больше не меняется.
+КАЛИБРОВКА (В СТОРОНУ → В ЦЕНТР):
+  1. Бот кликает В СТОРОНУ (+320,+230) — персонаж доходит, стоп.
+  2. Бот кликает В ЦЕНТР — персонаж доходит, стоп.
+  3. ME-бокс встаёт в центр; из диагонали считаются раздельные Sx и Sy.
 
-ПОДГОНКА ME: кнопки ←→↑↓ и стрелки клавиатуры (Shift = ×10), автосохранение.
-ПОЛЗУНОК масштаба. ESP 30 Гц, уголки, имена, дистанции, трейсеры.
-Ходьба кликами к энтити/в точку, автоохота. Память только ЧИТАЕТСЯ.
+МОДЕЛЬ (оси независимы):
+  экранX = Sx*мирX + Bx                 (камера по X стоит — поглощена в Bx)
+  экранY = Sy*(мирY − camY) + By        (camY живой из памяти GM+0x1258+0x88;
+                                         фолбэк: якорь AY с доводкой)
+
+ПОЛЗУНКИ МАСШТАБА: при смене ME и всё под ним ОСТАЁТСЯ на месте
+(якорь Bx/By пересчитывается так, чтобы персонаж не сдвинулся на экране).
+ПОДГОНКА ME: стрелки клавиатуры (Shift=×10) и кнопки, автосохранение.
+Ходьба кликами, автоохота. Память только ЧИТАЕТСЯ.
 Приватный сервер, админ, Windows x86.
 ================================================================================
 """
@@ -40,7 +43,11 @@ kernel32.ReadProcessMemory.argtypes = [wintypes.HANDLE, ctypes.c_void_p,
 kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
 
 SIG_GSI = "A1 ? ? ? ? C3 ? ? ? ? ? ? ? ? ? ? 55 8B EC 64 A1"
+CAM_SLOT = 0x1258
+CAMY_OFF = 0x88
 CAL_FILE = "esp_cal2.json"
+Y_RELOCK_STILL = 1.5
+Y_RELOCK_MIN = 2.0
 
 def hexd(d): return f"0x{d & 0xFFFFFFFF:08X}"
 
@@ -91,8 +98,8 @@ def find_module(pid, name_lower):
         if kernel32.Module32FirstW(snap, ctypes.byref(e)):
             while True:
                 if e.szModule.lower() == name_lower:
-                    return {"name": e.szModule,
-                            "base": ctypes.cast(e.modBaseAddr, ctypes.c_void_p).value or 0,
+                    base = ctypes.cast(e.modBaseAddr, ctypes.c_void_p).value or 0
+                    return {"name": e.szModule, "base": base,
                             "size": int(e.modBaseSize)}
                 if not kernel32.Module32NextW(snap, ctypes.byref(e)):
                     break
@@ -276,6 +283,18 @@ class GameReader:
         c = self.mem.read_int32(lp + 0x10C); m = self.mem.read_int32(lp + 0x110)
         if c is None or m is None or m <= 0: return None
         return (c, m)
+    def cam_y(self):
+        """Живой camY из памяти: GM+0x1258 → +0x88 (подтверждён диффом)."""
+        try:
+            gm = self.gm_ptr()
+            if not gm: return None
+            p = self.mem.read_uint32(gm + CAM_SLOT)
+            if not p or not self.mem.is_readable(p + CAMY_OFF, 4): return None
+            v = self.mem.read_float(p + CAMY_OFF)
+            if v is None or abs(v) > 1e6: return None
+            return v
+        except Exception:
+            return None
     def read_name(self, obj):
         mem = self.mem
         best, bs = "", 0.0
@@ -385,19 +404,22 @@ def run_gui():
     class App(tk.Tk):
         def __init__(self):
             super().__init__()
-            self.title("Warspear ESP — калибровка: в сторону → в центр (ME в центре, 1 раз)")
+            self.title("Warspear ESP — диагональная калибровка + раздельные оси")
             self.geometry("940x820")
             self.mem = None
             self.reader = None
             self.win = None
             self.pid = None
-            # якорная модель: экран = S*(мир − якорь) + центр; якорь ставится 1 раз
-            self.S = None
-            self.anchor = None
-            self.user_scale = 1.0
+            self.lock = threading.Lock()
+            self.Sx = self.Sy = None
+            self.Bx = self.By = None
+            self.AY = None
+            self.user_sx = 1.0
+            self.user_sy = 1.0
             self.me_dx = 0.0
             self.me_dy = 0.0
-            self.lock = threading.Lock()
+            self._y_last = None
+            self._y_still_since = None
             self.esp_ents = []
             self.last_ents = []
             self.selected_obj = None
@@ -411,16 +433,19 @@ def run_gui():
             self._load_cal()
             self._build_ui()
             self.after(300, self._tick)
+            self.after(500, self._y_watch)
 
         # ---------- persist ----------
         def _load_cal(self):
             try:
                 with open(CAL_FILE, "r", encoding="utf-8") as f:
                     d = json.load(f)
-                if d.get("S") is not None:
-                    self.S = float(d["S"])
-                    self.anchor = tuple(d["anchor"]) if d.get("anchor") else None
-                self.user_scale = float(d.get("user_scale", 1.0))
+                if d.get("Sx") is not None:
+                    self.Sx = float(d["Sx"]); self.Sy = float(d["Sy"])
+                    self.Bx = float(d["Bx"]); self.By = float(d["By"])
+                    self.AY = float(d["AY"]) if d.get("AY") is not None else None
+                self.user_sx = float(d.get("user_sx", 1.0))
+                self.user_sy = float(d.get("user_sy", 1.0))
                 self.me_dx = float(d.get("me_dx", 0.0))
                 self.me_dy = float(d.get("me_dy", 0.0))
             except Exception:
@@ -429,20 +454,20 @@ def run_gui():
         def _save_cal(self):
             try:
                 with open(CAL_FILE, "w", encoding="utf-8") as f:
-                    json.dump({"S": self.S,
-                               "anchor": list(self.anchor) if self.anchor else None,
-                               "user_scale": self.user_scale,
+                    json.dump({"Sx": self.Sx, "Sy": self.Sy,
+                               "Bx": self.Bx, "By": self.By, "AY": self.AY,
+                               "user_sx": self.user_sx, "user_sy": self.user_sy,
                                "me_dx": self.me_dx, "me_dy": self.me_dy},
                               f, indent=2)
             except Exception:
                 pass
 
         def _upd_cal_lbl(self):
-            if self.S is None or self.anchor is None:
+            if self.Sx is None:
                 self.cal_lbl.configure(text="не откалибровано", foreground="#b33")
             else:
                 self.cal_lbl.configure(
-                    text=f"S={self.S:.2f}px/юнит scale={self.user_scale:.2f} "
+                    text=f"Sx={self._eff_Sx():.2f} Sy={self._eff_Sy():.2f} "
                          f"ME=({self.me_dx:+.0f},{self.me_dy:+.0f}) ✔",
                     foreground="#2a2")
 
@@ -467,8 +492,10 @@ def run_gui():
             self.info_lbl.pack(anchor=tk.W)
 
             crow = ttk.Frame(self, padding=(10, 0)); crow.pack(fill=tk.X)
-            ttk.Button(crow, text="КАЛИБРОВКА (в сторону → в центр; ME в центр, 1 раз)",
+            ttk.Button(crow, text="КАЛИБРОВКА (в сторону → в центр; ME в центр)",
                        command=self.auto_calibrate).pack(side=tk.LEFT)
+            ttk.Button(crow, text="Только центр",
+                       command=self.recenter).pack(side=tk.LEFT, padx=6)
             ttk.Button(crow, text="Сброс",
                        command=self.cal_reset).pack(side=tk.LEFT, padx=6)
             self.cal_lbl = ttk.Label(crow, text="не откалибровано",
@@ -492,15 +519,20 @@ def run_gui():
             self.me_lbl.pack(side=tk.LEFT, padx=4)
 
             srow = ttk.Frame(self, padding=(10, 0)); srow.pack(fill=tk.X)
-            ttk.Label(srow, text="Масштаб ESP:").pack(side=tk.LEFT)
-            self.scale_var = tk.DoubleVar(value=self.user_scale)
-            ttk.Scale(srow, from_=0.6, to=1.6, variable=self.scale_var,
-                      length=280, command=self._on_scale).pack(side=tk.LEFT, padx=8)
-            self.scale_lbl = ttk.Label(srow, text=f"{self.user_scale:.2f}×",
-                                       font=("Consolas", 9), width=6)
-            self.scale_lbl.pack(side=tk.LEFT)
-            ttk.Label(srow, text="(растяжение расстояний между объектами)",
-                      foreground="#888").pack(side=tk.LEFT, padx=6)
+            ttk.Label(srow, text="Масштаб X:").pack(side=tk.LEFT)
+            self.sx_var = tk.DoubleVar(value=self.user_sx)
+            ttk.Scale(srow, from_=0.6, to=1.6, variable=self.sx_var, length=190,
+                      command=self._on_scale).pack(side=tk.LEFT, padx=4)
+            self.sx_lbl = ttk.Label(srow, text=f"{self.user_sx:.2f}×", width=6,
+                                    font=("Consolas", 9))
+            self.sx_lbl.pack(side=tk.LEFT)
+            ttk.Label(srow, text="Масштаб Y:").pack(side=tk.LEFT, padx=(14, 0))
+            self.sy_var = tk.DoubleVar(value=self.user_sy)
+            ttk.Scale(srow, from_=0.6, to=1.6, variable=self.sy_var, length=190,
+                      command=self._on_scale).pack(side=tk.LEFT, padx=4)
+            self.sy_lbl = ttk.Label(srow, text=f"{self.user_sy:.2f}×", width=6,
+                                    font=("Consolas", 9))
+            self.sy_lbl.pack(side=tk.LEFT)
 
             erow = ttk.Frame(self, padding=(10, 0)); erow.pack(fill=tk.X)
             self.esp_enabled = tk.BooleanVar(value=True)
@@ -612,17 +644,50 @@ def run_gui():
                     self.after(0, lambda s=step: self.nudge_me(0, s)); moved = True
                 time.sleep(0.12 if moved else 0.05)
 
+        # ---------- ПОЛЗУНКИ: ME остаётся на месте при смене масштаба ----------
+        def _cam_y_eff(self):
+            cy = self.reader.cam_y() if self.reader else None
+            return cy if cy is not None else self.AY
+
         def _on_scale(self, _v=None):
+            """Смена масштаба: экранная позиция персонажа сохраняется —
+            пересчитываем Bx/By под новые Sx/Sy."""
             try:
-                self.user_scale = float(self.scale_var.get())
+                new_sx = float(self.sx_var.get())
+                new_sy = float(self.sy_var.get())
             except Exception:
                 return
-            self.scale_lbl.configure(text=f"{self.user_scale:.2f}×")
+            p = self.reader.pos() if self.reader else None
+            cam = self._cam_y_eff()
+            camv = cam if cam is not None else 0.0
+            with self.lock:
+                old_Bx, old_By = self.Bx, self.By
+                if old_Bx is None or old_By is None or p is None:
+                    # ещё не калибровано — просто применяем
+                    self.user_sx = new_sx
+                    self.user_sy = new_sy
+                else:
+                    old_sx = self.Sx * self.user_sx
+                    old_sy = self.Sy * self.user_sy
+                    # экранная позиция персонажа СЕЙЧАС
+                    ex = old_sx * p[0] + old_Bx
+                    ey = old_sy * (p[1] - camv) + old_By
+                    # новые масштабы
+                    self.user_sx = new_sx
+                    self.user_sy = new_sy
+                    # B такие, чтобы персонаж остался в той же экранной точке
+                    self.Bx = ex - self._eff_Sx() * p[0]
+                    self.By = ey - self._eff_Sy() * (p[1] - camv)
+            self.sx_lbl.configure(text=f"{self.user_sx:.2f}×")
+            self.sy_lbl.configure(text=f"{self.user_sy:.2f}×")
             self._save_cal()
             self._upd_cal_lbl()
 
-        def _eff_S(self):
-            return self.S * self.user_scale
+        def _eff_Sx(self):
+            return self.Sx * self.user_sx
+
+        def _eff_Sy(self):
+            return self.Sy * self.user_sy
 
         # ---------- connect ----------
         def connect(self):
@@ -646,6 +711,11 @@ def run_gui():
                     self.log("[!] окно игры не найдено!")
                 if not reader.lp():
                     self.log("[!] LocalPlayer пуст — зайди в игру")
+                cy = reader.cam_y()
+                if cy is not None:
+                    self.log(f"[+] camY из памяти: {cy:.1f} ✔ — ось Y точная")
+                else:
+                    self.log("[!] camY не читается — ось Y по якорю с доводкой")
                 self.conn_lbl.configure(text=f"PID {pid} OK", foreground="#2a2")
                 self.btn_conn.configure(state=tk.DISABLED)
                 self.btn_disc.configure(state=tk.NORMAL)
@@ -683,26 +753,57 @@ def run_gui():
         # ---------- модель W2S ----------
         def w2s(self, wx, wy):
             with self.lock:
-                S = self._eff_S() if self.S is not None else None
-                a = self.anchor
-            if S is None or a is None:
+                Sx = self._eff_Sx() if self.Sx is not None else None
+                Sy = self._eff_Sy() if self.Sy is not None else None
+                Bx, By = self.Bx, self.By
+            if Sx is None or Sy is None or Bx is None or By is None:
                 return None
-            W, H = float(self.win.w), float(self.win.h)
-            return ((wx - a[0]) * S + W / 2 + self.me_dx,
-                    (wy - a[1]) * S + H / 2 + self.me_dy)
+            cy = self._cam_y_eff()
+            if cy is None:
+                return None
+            return (Sx * wx + Bx + self.me_dx,
+                    Sy * (wy - cy) + By + self.me_dy)
 
         def _in_safe_zone(self, sx, sy):
             W, H = float(self.win.w), float(self.win.h)
             return (SAFE_MARGIN <= sx <= W - SAFE_MARGIN and
                     SAFE_MARGIN <= sy <= H - UI_BOTTOM)
 
-        # ---------- КАЛИБРОВКА: в сторону → в центр (якорь 1 раз) ----------
+        # ---------- Y-доводка (фолбэк, если camY недоступен) ----------
+        def _y_watch(self):
+            try:
+                if self.reader and self.Sx is not None and not self.calibrating:
+                    if self.reader.cam_y() is not None:
+                        self.after(300, self._y_watch)
+                        return
+                    p = self.reader.pos()
+                    if p:
+                        if self._y_last is not None and \
+                           math.hypot(p[0]-self._y_last[0], p[1]-self._y_last[1]) < 0.05:
+                            if self._y_still_since is None:
+                                self._y_still_since = time.time()
+                            elif time.time() - self._y_still_since >= Y_RELOCK_STILL:
+                                if self.AY is not None and \
+                                   abs(p[1] - self.AY) >= Y_RELOCK_MIN:
+                                    self.AY = p[1]
+                                    self._save_cal()
+                                    self.log(f"[y] доводка: AY={p[1]:.1f}")
+                                self._y_still_since = time.time()
+                        else:
+                            self._y_still_since = None
+                        self._y_last = p
+            except Exception:
+                pass
+            self.after(300, self._y_watch)
+
+        # ---------- КАЛИБРОВКА: в сторону → в центр ----------
         def auto_calibrate(self):
             if not self._need(): return
             if self.calibrating: return
             self.calibrating = True
             self.log("[cal] 1) клик В СТОРОНУ (+320,+230) → 2) клик В ЦЕНТР → "
-                     "ME встанет в центр и якорь зафиксируется. Мышь не трогать.")
+                     "ME встанет в центр; масштабы Sx/Sy по диагонали. "
+                     "Мышь не трогать.")
             def thread_cal():
                 try:
                     self._auto_cal_sync()
@@ -716,41 +817,50 @@ def run_gui():
             p0 = self.reader.pos()
             if not p0:
                 self.log("[cal] нет позиции игрока"); return
-            # --- 1) клик В СТОРОНУ ---
+            # --- 1) клик В СТОРОНУ (диагональ) ---
             P1 = (W/2 + 320, H/2 + 230)
             send_click(hwnd, *P1, mode)
             p1 = self._wait_arrive()
             if not p1:
                 self.log("[cal] клик 1 (в сторону) не дошёл (открытое место!)"); return
+            cam1 = self.reader.cam_y()
             # --- 2) клик В ЦЕНТР ---
             P2 = (W/2, H/2)
             send_click(hwnd, *P2, mode)
             p2 = self._wait_arrive()
             if not p2:
                 self.log("[cal] клик 2 (в центр) не дошёл"); return
-            d_world = math.hypot(p1[0]-p0[0] + p2[0]-p1[0],
-                                 p1[1]-p0[1] + p2[1]-p1[1])
-            # масштаб по полному пройденному пути (p0→p1→p2)
-            path = math.hypot(p1[0]-p0[0], p1[1]-p0[1]) + \
-                   math.hypot(p2[0]-p1[0], p2[1]-p1[1])
-            px_path = math.hypot(P1[0]-W/2, P1[1]-H/2)  # клик1 от центра
-            if path < 8:
-                self.log(f"[cal] пройденный путь мал ({path:.1f}) — повтори")
+            cam2 = self.reader.cam_y()
+            # --- раздельные масштабы из диагонального сегмента p1→p2 ---
+            dwx = p2[0] - p1[0]
+            dwy = p2[1] - p1[1]
+            if abs(dwx) < 10 or abs(dwy) < 8:
+                self.log(f"[cal] диагональный сдвиг мал "
+                         f"(Δx={dwx:.1f}, Δy={dwy:.1f}) — повтори")
                 return
-            # масштаб: игрок шёл из p0 в p2; экранно это путь от (где был ME) —
-            # надёжнее считать по сегменту p1→p2: экранно это от P1 к P2
-            seg_world = math.hypot(p2[0]-p1[0], p2[1]-p1[1])
-            seg_px = math.hypot(P2[0]-P1[0], P2[1]-P1[1])
-            S = seg_px / seg_world if seg_world > 5 else (px_path / max(path - seg_world, 1.0))
-            # ★ ЯКОРЬ: текущая позиция = центр экрана. Один раз, больше не трогаем.
+            Sx = abs(P2[0] - P1[0]) / abs(dwx)
+            if cam1 is not None and cam2 is not None:
+                den_y = (p2[1] - cam2) - (p1[1] - cam1)
+                Sy = abs(P2[1] - P1[1]) / abs(den_y) if abs(den_y) > 5 else None
+                cy_note = "camY из памяти"
+            else:
+                Sy = abs(P2[1] - P1[1]) / abs(dwy)
+                cy_note = "camY недоступен — якорная модель"
+            if Sy is None:
+                self.log("[cal] Sy вырожден — повтори"); return
+            # --- B: точка p2 = центр экрана (ME в центре) ---
+            cam_here = cam2 if cam2 is not None else p2[1]
+            Bx = W/2 - Sx * p2[0]
+            By = H/2 - Sy * (p2[1] - cam_here)
             with self.lock:
-                self.S = S
-                self.anchor = p2
+                self.Sx, self.Sy = Sx, Sy
+                self.Bx, self.By = Bx, By
+                self.AY = p2[1]
             self._save_cal()
             self._upd_cal_lbl()
-            self.log(f"[cal] ★ ЯКОРЬ УСТАНОВЛЕН: мир ({p2[0]:.1f},{p2[1]:.1f}) = "
-                     f"центр экрана; S={S:.2f}px/юнит; больше не меняется")
-            self.log("[cal] Готово. ME в центре. Если надо чуть сдвинуть — стрелки.")
+            self.log(f"[cal] ✔ Sx={Sx:.2f} Sy={Sy:.2f}px/юнит ({cy_note}); "
+                     f"ME В ЦЕНТРЕ (мир {p2[0]:.1f},{p2[1]:.1f})")
+            self.log("[cal] Походи по X и по Y. Мелкая подгонка — стрелки/ползунки.")
 
         def _wait_arrive(self, timeout=25.0):
             last, stable, t0 = None, 0, time.time()
@@ -766,10 +876,40 @@ def run_gui():
                 time.sleep(0.2)
             return last
 
+        def recenter(self):
+            if not self._need(): return
+            if self.Sx is None:
+                self.log("[cal] сначала полная калибровка"); return
+            if self.calibrating: return
+            self.calibrating = True
+            def thread_cal():
+                try:
+                    W, H = float(self.win.w), float(self.win.h)
+                    send_click(self.win.hwnd, W/2, H/2, self.mode_var.get())
+                    p = self._wait_arrive()
+                    if not p:
+                        p = self.reader.pos()
+                        if not p:
+                            self.log("[cal] клик не дошёл"); return
+                    cam = self.reader.cam_y()
+                    cam = cam if cam is not None else p[1]
+                    with self.lock:
+                        self.Bx = W/2 - self._eff_Sx() * p[0]
+                        self.By = H/2 - self._eff_Sy() * (p[1] - cam)
+                        self.AY = p[1]
+                    self._save_cal()
+                    self._upd_cal_lbl()
+                    self.log(f"[cal] центр перепривязан: ME в центре "
+                             f"(мир {p[0]:.1f},{p[1]:.1f})")
+                finally:
+                    self.calibrating = False
+            threading.Thread(target=thread_cal, daemon=True).start()
+
         def cal_reset(self):
             with self.lock:
-                self.S = None
-                self.anchor = None
+                self.Sx = self.Sy = None
+                self.Bx = self.By = None
+                self.AY = None
             self._save_cal()
             self._upd_cal_lbl()
             self.log("[cal] сброшена")
@@ -839,7 +979,7 @@ def run_gui():
             self.walk_stop.set(); self.log("[walk] остановлено")
 
         def _start_walk(self, fn, *args):
-            if self.S is None or self.anchor is None:
+            if self.Sx is None:
                 self.log("[walk] сначала КАЛИБРОВКА"); return
             self.walk_stop.set(); time.sleep(0.15); self.walk_stop.clear()
             self.walk_thread = threading.Thread(target=fn, args=args, daemon=True)
@@ -885,7 +1025,7 @@ def run_gui():
         # ---------- автоохота ----------
         def hunt_start(self):
             if not self._need(): return
-            if self.S is None or self.anchor is None:
+            if self.Sx is None:
                 self.log("[hunt] сначала КАЛИБРОВКА"); return
             if self.hunt_thread and self.hunt_thread.is_alive(): return
             self.hunt_stop.clear()
@@ -1034,19 +1174,18 @@ def run_gui():
                 return
             ov = self.overlay
             if ov is None: return
-            if self.S is None or self.anchor is None:
+            if self.Sx is None:
                 msg = "ESP: нажми КАЛИБРОВКУ (в сторону → в центр)"
                 self.after(0, lambda: ov.draw([], None, msg, {"enabled": True}))
                 return
             W, H = float(self.win.w), float(self.win.h)
             p = self.reader.pos()
             if not p: return
-            with self.lock:
-                ents = list(self.esp_ents)
+            ents = list(self.esp_ents)
             lp_obj = self.reader.lp()
             items, player_sp = [], None
             for e in ents:
-                xy = self.reader.ent_xy(e["obj"])   # свежие координаты 30 Гц
+                xy = self.reader.ent_xy(e["obj"])
                 if xy: e["x"], e["y"] = xy
                 s = self.w2s(e["x"], e["y"])
                 if not s: continue
@@ -1057,8 +1196,8 @@ def run_gui():
                     d = math.hypot(e["x"]-p[0], e["y"]-p[1])
                     items.append((s[0], s[1], (e["name"] or "?")[:16], d,
                                   e["obj"] == self.selected_obj))
-            info = (f"ESP30 S={self._eff_S():.1f}px/u n={len(items)} "
-                    f"scale={self.user_scale:.2f} pos=({p[0]:.0f},{p[1]:.0f})")
+            info = (f"ESP30 Sx={self._eff_Sx():.1f} Sy={self._eff_Sy():.1f} "
+                    f"n={len(items)} pos=({p[0]:.0f},{p[1]:.0f})")
             opts = {"enabled": True, "names": self.esp_names.get(),
                     "dist": self.esp_dist.get(), "lines": self.esp_lines.get(),
                     "player": self.esp_player.get()}
@@ -1072,8 +1211,7 @@ def run_gui():
                     p = self.reader.pos()
                     for e in ents:
                         e["dist"] = (math.hypot(e["x"]-p[0], e["y"]-p[1]) if p else 0.0)
-                    with self.lock:
-                        self.esp_ents = ents
+                    self.esp_ents = ents
                     self.last_ents = ents
                     filt = self.ent_filter.get().strip().lower()
                     rows = [e for e in ents
@@ -1094,14 +1232,16 @@ def run_gui():
                         if sel_obj == e["obj"]:
                             t.selection_set(iid)
                     hpp = self.reader.hp()
-                    ctxt = (f"S={self._eff_S():.1f}px/u scale={self.user_scale:.2f} "
-                            f"ME=({self.me_dx:+.0f},{self.me_dy:+.0f})"
-                            if self.S is not None else "НЕ ОТКАЛИБРОВАНО")
+                    if self.Sx is not None:
+                        ctxt = (f"Sx={self._eff_Sx():.1f} Sy={self._eff_Sy():.1f} "
+                                f"ME=({self.me_dx:+.0f},{self.me_dy:+.0f})")
+                    else:
+                        ctxt = "НЕ ОТКАЛИБРОВАНО"
                     self.info_lbl.configure(text=
                         (f"X: {p[0]:.1f}  Y: {p[1]:.1f}  HP: {hpp[0]}/{hpp[1]}  |  {ctxt}")
                         if (p and hpp) else f"LP пуст | {ctxt}")
             except Exception as ex:
-                self.log(f"[tick] {type(e).__name__ if False else type(ex).__name__}: {ex}")
+                self.log(f"[tick] {type(ex).__name__}: {ex}")
             self.after(1000, self._tick)
 
     app = App()
@@ -1109,5 +1249,6 @@ def run_gui():
 
 if __name__ == "__main__":
     if sys.platform != "win32":
-        print("Нужен Windows"); sys.exit(1)
+        print("Нужен Windows")
+        sys.exit(1)
     run_gui()
